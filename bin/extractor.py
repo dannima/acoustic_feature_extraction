@@ -1,5 +1,26 @@
 #!/usr/bin/env python
-"""Extract acoustic embeddings."""
+"""Extract acoustic embeddings.
+
+To extract acoustic features from a pre-trained model (e.g., Whisper) for the
+audio file ``audio/test.wav``, and save the features in the directory
+``feats/whisper``, run:
+
+    python extractor.py -f whisper feats/whisper audio/test.wav
+
+where the ``-f`` flag specifies the name of the pre-trained model.
+
+The -f flag specifies the name of the pre-trained model.
+
+By default, the script uses the CPU for feature extraction. However, you can
+utilize the GPU by adding the ``--use-gpu`` flag. To disable the progress bar,
+include the ``--disable-progress`` flag. Additionally, you can adjust the
+number of parallel jobs by using the ``--n-jobs`` flag. Here's an example that
+combines these options:
+
+    python extractor.py -f whisper --use-gpu --disable-progress --n_jobs -1 \
+        feats/whisper audio/test.wav
+
+"""
 import argparse
 import librosa
 import logging
@@ -13,7 +34,6 @@ import torch
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from torch import nn
 from transformers import (
     UniSpeechModel, Wav2Vec2FeatureExtractor, Wav2Vec2Model,
     WhisperFeatureExtractor, WhisperModel)
@@ -26,18 +46,8 @@ logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler()
 logger.addHandler(console_handler)
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.set_default_tensor_type('torch.cuda.FloatTensor')
-torch.multiprocessing.set_sharing_strategy('file_system')
-try:
-    multiprocessing.set_start_method('spawn')
-except RuntimeError:
-    pass
-
 
 def get_minibatches_idx(n, minibatch_size):
-    '''Randomly select indices to form mini batches.'''
     idx_list = np.arange(n, dtype="int32")
     minibatches = []
     minibatch_start = 0
@@ -48,7 +58,7 @@ def get_minibatches_idx(n, minibatch_size):
     return minibatches
 
 
-def get_model(pretrained_model):
+def get_model(pretrained_model, device):
     if pretrained_model.startswith("u"):
         model_name = "microsoft/unispeech-large-1500h-cv"
         model = UniSpeechModel.from_pretrained(model_name)
@@ -65,59 +75,38 @@ def get_model(pretrained_model):
         feature_extractor = WhisperFeatureExtractor.from_pretrained(
             model_name)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = nn.DataParallel(model)
     model = model.to(device)
-    return model, feature_extractor, device
+    return model, feature_extractor
 
 
 class wav2vec2:
-    def extract(
-            af, frame_length, hop_length, feats_dir, pretrained_model,
-            minibatch_size, n_gpus):
+    def extract(af, feats_dir, pretrained_model, device):
         y, sr = librosa.load(af, sr=16000)
-        model, feature_extractor, device = get_model(pretrained_model)
-        if frame_length * minibatch_size < len(y):
-            # Slice audio into frames if audio is long
-            y = librosa.util.frame(
-                y, frame_length=frame_length, hop_length=hop_length).T
-
-            extractor = feature_extractor(
-                y, return_tensors="pt", sampling_rate=sr)
-            i = extractor.input_values
-            i = torch.squeeze(extractor.input_values)
-            minibatches = get_minibatches_idx(len(i), minibatch_size)
-
-            # To avoid shape mismatch error due to using multiple GPUs
-            if n_gpus > 1:
-                if len(minibatches[-1]) < minibatch_size:
-                    first = len(
-                        minibatches[-1]) - len(minibatches[-1]) % n_gpus
-                    minibatches[-1] = minibatches[-1][:first]
-
-            extracted_feats = np.empty((0, 1024))
-            for num, minibatch in enumerate(minibatches):
+        model, feature_extractor = get_model(pretrained_model, device)
+        """
+        It's weird that when using wav2vec2 feature extractor, one need to
+        subtract 80 extra samples before calculating timepoints (stride=20ms).
+        """
+        minibatch_size = 16000 * 130 + 80
+        minibatches = get_minibatches_idx(len(y), minibatch_size)
+        extracted_feats = np.empty((0, 1024))
+        for num, minibatch in enumerate(minibatches):
+            if num % 10 == 0:
                 logger.info(f'Minibatch # {num}')
-                inputs = i[minibatch]
-                inputs = inputs.to(device)
-                with torch.no_grad():
-                    output = model(inputs)
-
-                feats = output.last_hidden_state
-                feats = feats.cpu().detach().numpy()
-                feats = np.squeeze(feats)
-                feats = feats.reshape(-1, feats.shape[-1])
-                extracted_feats = np.vstack((extracted_feats, feats))
-        else:
+            z = y[minibatch]
             extractor = feature_extractor(
-                y, return_tensors="pt", sampling_rate=sr)
-            i = extractor.input_values
-            i = i.to(device)
+                z, return_tensors="pt", sampling_rate=sr)
+            inputs = extractor.input_values
+            inputs = inputs.to(device)
+
             with torch.no_grad():
-                output = model(i)
+                output = model(inputs)
+
             feats = output.last_hidden_state
             feats = feats.cpu().detach().numpy()
-            extracted_feats = np.squeeze(feats)
+            feats = np.squeeze(feats)
+            feats = feats.reshape(-1, feats.shape[-1])
+            extracted_feats = np.vstack((extracted_feats, feats))
 
         dur = librosa.get_duration(y=y, sr=sr)
         time_points = np.array([round(i, 2) for i in np.arange(
@@ -129,9 +118,9 @@ class wav2vec2:
 
 
 class whisper:
-    def extract(af, feats_dir, pretrained_model, n_gpus):
+    def extract(af, feats_dir, pretrained_model, device):
         y, sr = librosa.load(af, sr=16000)
-        model, feature_extractor, device = get_model(pretrained_model)
+        model, feature_extractor = get_model(pretrained_model, device)
         """
         From Whisper authors:
         The encoder always takes 30-second-long audio as input, and we trim or
@@ -141,7 +130,6 @@ class whisper:
         """
         minibatch_size = 16000 * 30
         minibatches = get_minibatches_idx(len(y), minibatch_size)
-
         extracted_feats = np.empty((0, 512))
         for num, minibatch in enumerate(minibatches):
             if num % 10 == 0:
@@ -151,6 +139,7 @@ class whisper:
                 z, return_tensors="pt", sampling_rate=sr)
             inputs = extractor.input_features
             inputs = inputs.to(device)
+
             with torch.no_grad():
                 output = model(inputs)
 
@@ -161,9 +150,8 @@ class whisper:
             extracted_feats = np.vstack((extracted_feats, feats))
 
         frame_to_slice = int(30 / 0.02 - math.floor(
-        	len(minibatches[-1]) / minibatch_size * (30 / 0.02)))
+            len(minibatches[-1]) / minibatch_size * (30 / 0.02)))
         extracted_feats = extracted_feats[:-frame_to_slice]
-        logger.info(f"extracted_feats shape: {extracted_feats.shape}")
 
         dur = librosa.get_duration(y=y, sr=sr)
         time_points = np.array([round(i, 2) for i in np.arange(
@@ -186,12 +174,8 @@ def main():
         '-f', '--feat', dest='feats', type=str, metavar='STR',
         help='The model used to extract features.')
     parser.add_argument(
-        '--frame-len', type=int, default=3920, help='Length of the frame')
-    parser.add_argument(
-        '--hop-len', type=int, default=3920,
-        help='Number of steps to advance between frames')
-    # parser.add_argument(
-    #     '--use-gpu', default=False, action='store_true', help='Use GPU.')
+        '--use-gpu', action="store_true", default=False,
+        help="Use GPU for feature extraction.")
     parser.add_argument(
         '--disable-progress', default=False, action='store_true',
         help='disable progress bar')
@@ -199,9 +183,6 @@ def main():
         '--n-jobs', metavar='N', type=int, nargs=None, default=1,
         help='perform processing using N parallel jobs (default: %(default)s)'
         )
-    parser.add_argument(
-        '--n-gpus', dest='n_gpus', nargs=None, default=1, type=int,
-        help='number of GPUs (default: %(default)s)')
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -209,28 +190,21 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.feats_dir, exist_ok=True)
 
-    if args.n_gpus > 0:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(x) for x in list(range(args.n_gpus)))
-    else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
-    # minibatch_size = 5000 for 6 GPUs, minibatch_size = 800 for 1 GPU
-    minibatch_size = 800
+    # Set device.
+    device = torch.device(
+        "cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
 
     # Process.
     audio_paths = sorted(args.afs)
     pool = multiprocessing.get_context('spawn').Pool(args.n_jobs)
     if args.feats.startswith("u") or args.feats.startswith("wa"):
         f = partial(
-            wav2vec2.extract, frame_length=args.frame_len,
-            hop_length=args.hop_len, feats_dir=args.feats_dir,
-            pretrained_model=args.feats, minibatch_size=minibatch_size,
-            n_gpus=args.n_gpus)
+            wav2vec2.extract, feats_dir=args.feats_dir,
+            pretrained_model=args.feats, device=device)
     elif args.feats.startswith("wh"):
         f = partial(
             whisper.extract, feats_dir=args.feats_dir,
-            pretrained_model=args.feats, n_gpus=args.n_gpus)
+            pretrained_model=args.feats, device=device)
     with tqdm(total=len(audio_paths), disable=args.disable_progress) as pbar:
         for _ in pool.imap(f, audio_paths):
             pbar.update(1)
