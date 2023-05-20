@@ -26,7 +26,8 @@ LOGS_DIR=${PROJECT_DIR}/logs
 BIN_DIR=${PROJECT_DIR}/bin
 
 # Pretrained acoustic models.
-MODELS="wav2vec2 whisper unispeech"
+MODELS="facebook/wav2vec2-large-lv60 microsoft/unispeech-large-1500h-cv \
+        openai/whisper-base"
 
 # Current stage.
 stage=0
@@ -36,8 +37,10 @@ stage=0
 # Extract features
 ##################################
 if [ $stage -le 1 ]; then
-    for model in ${MODELS}; do
-    	args="-f ${model} --use-gpu --n-jobs 1"
+    for model_name in ${MODELS}; do
+    	args="--model ${model_name} --chunk-size 130 --use-gpu \
+    	      --cache-dir None --n-jobs 1"
+    	model=${model_name#*/}
 		logf=${LOGS_DIR}/${model}_${DATE}.log
 		echo "Extracting features using ${model}..."
 		python ${BIN_DIR}/extractor.py \
