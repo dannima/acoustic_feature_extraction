@@ -39,7 +39,7 @@ stage=0
 if [ $stage -le 1 ]; then
     for model_name in ${MODELS}; do
     	args="--model ${model_name} --chunk-size 130 --use-gpu \
-    	      --cache-dir None --n-jobs 1"
+    	      --cache-dir checkpoints --n-jobs 1"
     	model=${model_name#*/}
 		logf=${LOGS_DIR}/${model}_${DATE}.log
 		echo "Extracting features using ${model}..."

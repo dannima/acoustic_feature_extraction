@@ -28,7 +28,7 @@ number of parallel jobs by using the ``--n-jobs`` flag. Here's an example that
 combines all these options:
 
     python extractor.py --model openai/whisper-base --chunk-size 10 \
-        --use-gpu --disable-progress --cache-dir None --n_jobs 1 \
+        --use-gpu --disable-progress --cache-dir checkpoints/ --n_jobs 1 \
         feats/whisper audio/test.wav
 """
 import argparse
@@ -50,6 +50,10 @@ from transformers import (
 from tqdm import tqdm
 
 
+MODEL_MAPPING = {"unispeech": (UniSpeechModel, Wav2Vec2FeatureExtractor),
+                 "wav2vec2": (Wav2Vec2Model, Wav2Vec2FeatureExtractor),
+                 "whisper": (WhisperModel, WhisperFeatureExtractor)}
+
 # Set up a logger
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -69,28 +73,23 @@ def get_minibatches_idx(n, minibatch_size):
 
 
 def get_model(pretrained_model, device, cache_dir):
-    if "unispeech" in pretrained_model:
+    get_encoder = False
+    for key, val in MODEL_MAPPING.items():
+        if key in pretrained_model:
+            if key == "whisper":
+                get_encoder = True
+            AcousticModel, FeatExtractor = val
+            break
+    if AcousticModel and FeatExtractor:
         try:
-            model = UniSpeechModel.from_pretrained(
+            if get_encoder:
+                model = AcousticModel.from_pretrained(
+                    pretrained_model, cache_dir=cache_dir).encoder
+            else:
+                model = AcousticModel.from_pretrained(
+                    pretrained_model, cache_dir=cache_dir)
+            feature_extractor = FeatExtractor.from_pretrained(
                 pretrained_model, cache_dir=cache_dir)
-            feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-                pretrained_model)
-        except Exception:
-            raise
-    elif "wav2vec2" in pretrained_model:
-        try:
-            model = Wav2Vec2Model.from_pretrained(
-                pretrained_model, cache_dir=cache_dir)
-            feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-                pretrained_model)
-        except Exception:
-            raise
-    elif "whisper" in pretrained_model:
-        try:
-            model = WhisperModel.from_pretrained(
-                pretrained_model, cache_dir=cache_dir).encoder
-            feature_extractor = WhisperFeatureExtractor.from_pretrained(
-                pretrained_model)
         except Exception:
             raise
     else:
@@ -152,8 +151,9 @@ def main():
     parser.add_argument(
         'afs', nargs='+', type=Path, help='Audio files to be processed.')
     parser.add_argument(
-        '--model', type=str, metavar='STR',
-        help='A model name in the Hugging Face model hub')
+        '--model', type=str, metavar='STR', default='openai/whisper-base',
+        help='A model name in the Hugging Face model hub (default: Whisper '
+             'base)')
     parser.add_argument(
         '--chunk-size', type=int, default=130,
         help='Length of chunks that a long-form audio file will be sliced '
